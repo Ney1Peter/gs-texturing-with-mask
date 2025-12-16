@@ -211,7 +211,7 @@ class Trainer:
         self.prepare_output_and_logger()
         
         self.scene: Scene = Scene(model_args, num_pts=model_args.cap_max if model_args.cap_max != -1 else 1_000_000)
-        self.gmodel: GaussianModel = GaussianModel(model_args.sh_degree, opt_args.max_texture_resolution)
+        self.gmodel: GaussianModel = GaussianModel(model_args.sh_degree, opt_args.max_texture_resolution, device=model_args.data_device)
         self.optimizer: OptimizerContainer = OptimizerContainer()
 
         self.log_dict: dict[str, float] = {
@@ -243,7 +243,7 @@ class Trainer:
         with torch.no_grad():
             # Initialize pixel size, necessary for correct texture querying
             self.gmodel._pixel_size = Controller.aggregate_projected_pixel_sizes_cuda(self.gmodel, self.scene.getTrainCameras())
-            self.gmodel.initialise_texel_pixel_ratio(initial_texture_resolution = torch.tensor([8,8], device="cuda"))
+            self.gmodel.initialise_texel_pixel_ratio(initial_texture_resolution = torch.tensor([8,8], device=self.gmodel.device))
         
         # Generator that returns a camera, ensuring a full, randomised access to the dataset at each epoch
         # Credits to Petros
@@ -251,9 +251,9 @@ class Trainer:
     
         # Choose background color
         if self._opt_args.random_background:
-            self.bg_color = torch.rand((3), dtype=torch.float32, device="cuda")
+            self.bg_color = torch.rand((3), dtype=torch.float32, device=self.gmodel.device)
         else:
-            self.bg_color = torch.tensor([1, 1, 1] if self._model_args.white_background else [0, 0, 0], dtype=torch.float32, device="cuda")
+            self.bg_color = torch.tensor([1, 1, 1] if self._model_args.white_background else [0, 0, 0], dtype=torch.float32, device=self.gmodel.device)
 
         # Holds information for newly added, upsampled and downsampled primitives
         self.gmodel.error_stats = ErrorStats(self.gmodel.num_primitives)
@@ -279,11 +279,11 @@ class Trainer:
         """Compute the different loss functions and the total loss."""
 
         # 获取mask信息
-        mask = self.current_viewpoint.original_mask.cuda()
+        mask = self.current_viewpoint.original_mask.to(self.current_viewpoint.data_device)
 
         # Per gaussian losses
         if self._opt_args.lambda_alpha_regul == 0:
-            Lalpha_regul = torch.tensor([0.], device="cuda")
+            Lalpha_regul = torch.tensor([0.], device=self.gmodel.device)
         else:
             Lalpha_regul = (self.gmodel.get_opacity * self.visibility_filter.view(-1, 1)).mean()
 
@@ -324,7 +324,7 @@ class Trainer:
             n_primitives_before = self.gmodel.num_primitives
             prune_mask = self.gmodel.split_textured_primitives(
                 self.optimizer,
-                torch.tensor([round(self.curr_splitting_threshold), round(self.curr_splitting_threshold)], dtype=torch.int32, device="cuda"),
+                torch.tensor([round(self.curr_splitting_threshold), round(self.curr_splitting_threshold)], dtype=torch.int32, device=self.gmodel.device),
                 direction_idx,
                 percentile=self._opt_args.adaptive_texelsize_percentile,
                 max_points=self._model_args.cap_max)
@@ -368,10 +368,10 @@ class Trainer:
         """Function that calls the downscaling routine for all primitives"""
 
         if mask is None:
-            mask = torch.ones(self.gmodel.num_primitives, dtype=torch.bool, device="cuda")
+            mask = torch.ones(self.gmodel.num_primitives, dtype=torch.bool, device=self.gmodel.device)
 
         # Prevent downscale of primitives that have a low texture resolution already
-        inv_low_texres_mask = (self.gmodel._calculate_active_texture_resolution(powers_of_two=True) > torch.tensor([2,2], device="cuda")).any(dim=1)
+        inv_low_texres_mask = (self.gmodel._calculate_active_texture_resolution(powers_of_two=True) > torch.tensor([2,2], device=self.gmodel.device)).any(dim=1)
 
         self.gmodel.decrease_texture_resolution(
             self.optimizer,
@@ -454,7 +454,7 @@ class Trainer:
         """Activates training for texture maps"""
 
         self.optimizer.activate_training("texture_map")
-        self.gmodel.initialise_texel_pixel_ratio(initial_texture_resolution = torch.tensor([8,8], device="cuda"))
+        self.gmodel.initialise_texel_pixel_ratio(initial_texture_resolution = torch.tensor([8,8], device=self.gmodel.device))
 
     def log(self, iteration: int, elapsed_time: float, testing_iterations: list[int]):
         """If tensorboard is installed and enabled, logs various information to the writer."""
@@ -567,7 +567,7 @@ class Trainer:
 
         self.optimizer.optimizer.load_state_dict(opt_dict)
         self.gmodel._pixel_size = Controller.aggregate_projected_pixel_sizes_cuda(self.gmodel, self.scene.getTrainCameras())
-        self.gmodel.initialise_texel_pixel_ratio(initial_texture_resolution = torch.tensor([8,8], device="cuda"))
+        self.gmodel.initialise_texel_pixel_ratio(initial_texture_resolution = torch.tensor([8,8], device=self.gmodel.device))
         
         return iteration
 
@@ -583,7 +583,7 @@ class Controller:
         pixel_sizes_world = initial_value * torch.ones_like(gmodel.get_opacity).detach()
 
         w2ndc_transform = camera.full_proj_transform
-        ndc_centers_hom = torch.matmul(torch.cat((gmodel.get_xyz, torch.ones((gmodel.num_primitives, 1), device="cuda")), dim=1).unsqueeze(1), w2ndc_transform.unsqueeze(0)).squeeze()
+        ndc_centers_hom = torch.matmul(torch.cat((gmodel.get_xyz, torch.ones((gmodel.num_primitives, 1), device=gmodel.device)), dim=1).unsqueeze(1), w2ndc_transform.unsqueeze(0)).squeeze()
         ndc_centers_hom /= ndc_centers_hom.clone()[:, -1:]
 
         depths = ndc_centers_hom[:, 2]
@@ -597,11 +597,11 @@ class Controller:
         p_hom = torch.zeros_like(ndc_centers_hom)
         p_hom[:, 0 if camera.image_width > camera.image_height else 1] = min(2/camera.image_width, 2/camera.image_height)
         p_hom[:, 2] = depths
-        p_hom[:, 3] = torch.ones(gmodel.num_primitives, device="cuda")
+        p_hom[:, 3] = torch.ones(gmodel.num_primitives, device=gmodel.device)
         
         p_hom_zero = torch.zeros_like(ndc_centers_hom)
         p_hom_zero[:, 2] = depths
-        p_hom_zero[:, 3] = torch.ones(gmodel.num_primitives, device="cuda")
+        p_hom_zero[:, 3] = torch.ones(gmodel.num_primitives, device=gmodel.device)
         
         # NDC [-1, 1] x [-1, 1] -> Pixel space [0, W] x [0, H]
         # [x, y, depth, 1] [x', y, depth, 1] -> [x_proj, y_proj, depth_proj, 1] - [x'_proj, y_proj, depth_proj, 1] -> [dx_proj, 0, 0, 1]
@@ -640,8 +640,8 @@ class Controller:
             torch.stack([camera.full_proj_transform]),
             torch.stack([camera.inverse_full_proj_transform]),
             gmodel._xyz,
-            torch.tensor([camera.image_height], dtype=torch.int32, device="cuda"),
-            torch.tensor([camera.image_width], dtype=torch.int32, device="cuda"))
+            torch.tensor([camera.image_height], dtype=torch.int32, device=gmodel.device),
+            torch.tensor([camera.image_width], dtype=torch.int32, device=gmodel.device))
 
     @staticmethod
     def aggregate_projected_pixel_sizes_cuda(gmodel: GaussianModel, cameras: list[Camera], initial_value: float = 10000., aggregate_max: bool = False) -> torch.Tensor:
@@ -649,8 +649,8 @@ class Controller:
             torch.stack([camera.full_proj_transform for camera in cameras]),
             torch.stack([camera.inverse_full_proj_transform for camera in cameras]),
             gmodel._xyz,
-            torch.tensor([camera.image_height for camera in cameras], dtype=torch.int32, device="cuda"),
-            torch.tensor([camera.image_width for camera in cameras], dtype=torch.int32, device="cuda"),
+            torch.tensor([camera.image_height for camera in cameras], dtype=torch.int32, device=gmodel.device),
+            torch.tensor([camera.image_width for camera in cameras], dtype=torch.int32, device=gmodel.device),
             initial_value,
             aggregate_max)
         mask = pixel_sizes == initial_value
@@ -693,8 +693,8 @@ class Controller:
         gmodel.save_texture_maps(point_cloud_path, optimizer, quantize)
 
     @staticmethod
-    def load_gmodel(path: str, quantize: bool = False, sh_degree: int = 3, max_texture_resolution: int = 256) -> GaussianModel:
-        gmodel: GaussianModel = GaussianModel(sh_degree, max_texture_resolution)
+    def load_gmodel(path: str, quantize: bool = False, sh_degree: int = 3, max_texture_resolution: int = 256, device: str = "cuda") -> GaussianModel:
+        gmodel: GaussianModel = GaussianModel(sh_degree, max_texture_resolution, device=device)
         gmodel.load_ply(os.path.join(path, "point_cloud.ply"))
         gmodel.load_texture_maps(path, quantize)
 

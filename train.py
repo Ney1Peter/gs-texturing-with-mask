@@ -57,7 +57,7 @@ def training(dataset, opt, pipe, init_args, testing_iterations, saving_iteration
             trainer._pipe_args.debug = True
 
         trainer.forward_pass(viewpoint_cam)
-        trainer.compute_losses(viewpoint_cam.original_image.cuda())
+        trainer.compute_losses(viewpoint_cam.original_image.to(viewpoint_cam.data_device))
         trainer.backward_pass()
 
         viewer.gaussian_lock.acquire()

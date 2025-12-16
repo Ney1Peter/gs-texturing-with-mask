@@ -39,13 +39,13 @@ class Codebook():
 def generate_codebook(values: torch.Tensor, inverse_activation_fn: Callable[[torch.Tensor], torch.Tensor] = lambda x: x, num_clusters: int = 256, tol: float = 0.0001):
     shape = values.shape
     values = values.flatten().view(-1, 1)
-    centers = values[torch.randint(values.shape[0], (num_clusters, 1), device="cuda").squeeze()].view(-1,1)
+    centers = values[torch.randint(values.shape[0], (num_clusters, 1), device=values.device).squeeze()].view(-1,1)
 
     ids, centers = kmeans_cuda(values, centers.squeeze(), tol, 500)
     ids = ids.byte().squeeze().view(shape)
     centers = centers.view(-1,1)
 
-    return Codebook(ids.cuda(), inverse_activation_fn(centers.cuda()))
+    return Codebook(ids.to(values.device), inverse_activation_fn(centers.to(values.device)))
 
 class GaussianModel:
 
@@ -69,9 +69,10 @@ class GaussianModel:
         self.rotation_activation = torch.nn.functional.normalize
 
 
-    def __init__(self, sh_degree : int, max_texture_resolution: int, texture_cutoff: float = 3):
+    def __init__(self, sh_degree : int, max_texture_resolution: int, texture_cutoff: float = 3, device: str = "cuda"):
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree  
+        self.device = torch.device(device)
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
         self._features_rest = torch.empty(0)
@@ -174,7 +175,7 @@ class GaussianModel:
             return world_extent / self.texel_size
         texture_extent = torch.ceil(world_extent / self.texel_size).long()
 
-        max_tex_res = torch.tensor((self._max_texture_resolution, self._max_texture_resolution), device="cuda", dtype=torch.int32)
+        max_tex_res = torch.tensor((self._max_texture_resolution, self._max_texture_resolution), device=self.device, dtype=torch.int32)
 
         start = torch.floor((max_tex_res - 1) / 2 - texture_extent/2).clamp_min(0)
         end = torch.ceil((max_tex_res - 1) / 2 + texture_extent/2) + 1
@@ -197,15 +198,15 @@ class GaussianModel:
             self.active_sh_degree += 1
 
     def create_from_pcd(self, pcd : BasicPointCloud, num_samples=-1):
-        mask = torch.ones((pcd.points.shape[0]), dtype=torch.bool, device="cuda")
+        mask = torch.ones((pcd.points.shape[0]), dtype=torch.bool, device=self.device)
         if num_samples > -1:
             mask = ~mask
             indices = torch.randperm(mask.shape[0])[:num_samples]
             mask[indices] = True
-        fused_point_cloud = torch.from_numpy(np.asarray(pcd.points)).float().cuda()[mask]
-        fused_color = RGB2SH(torch.from_numpy(np.asarray(pcd.colors)).float().cuda()[mask])
+        fused_point_cloud = torch.from_numpy(np.asarray(pcd.points)).float().to(self.device)[mask]
+        fused_color = RGB2SH(torch.from_numpy(np.asarray(pcd.colors)).float().to(self.device)[mask])
 
-        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().to(self.device)
         features[:, :3, 0] = fused_color
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
@@ -215,9 +216,9 @@ class GaussianModel:
         scales = self.scaling_inverse_activation(dist2)[...,None].repeat(1, 3)
         scales[:, 2] = scales[:, 2] - 5
         
-        rots = torch.rand((fused_point_cloud.shape[0], 4), device="cuda")
+        rots = torch.rand((fused_point_cloud.shape[0], 4), device=self.device)
 
-        opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        opacities = self.inverse_opacity_activation(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device=self.device))
 
         self._xyz = fused_point_cloud.requires_grad_(True)
         self._features_dc = features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True)
@@ -227,10 +228,10 @@ class GaussianModel:
         self._opacity = opacities.requires_grad_(True)
         
         self._texture_map = JaggedTensor(
-            torch.ones((self.num_primitives, 2), device="cuda", dtype=torch.int32) * 2,
-            self.inverse_texture_map_activation(0.000001 * torch.ones([self.num_primitives, 2 * 2, 3], device="cuda")).reshape(-1, 3))
+            torch.ones((self.num_primitives, 2), device=self.device, dtype=torch.int32) * 2,
+            self.inverse_texture_map_activation(0.000001 * torch.ones([self.num_primitives, 2 * 2, 3], device=self.device)).reshape(-1, 3))
         self._texture_map._values.requires_grad_(True)
-        self._texel_pixel_ratio = 1 * torch.ones(self.num_primitives, 1, device="cuda", dtype=torch.int32)
+        self._texel_pixel_ratio = 1 * torch.ones(self.num_primitives, 1, device=self.device, dtype=torch.int32)
     
     def construct_list_of_attributes(self, rest_coeffs=45):
         return ['x', 'y', 'z',
@@ -315,13 +316,13 @@ class GaussianModel:
                 np.zeros((num_primitives, 3, max_coeffs_num - coeffs_num), dtype=attribute_type)), axis=2)
 
 
-        xyz = torch.from_numpy(xyz).cuda()
-        features_dc = torch.from_numpy(features_dc).contiguous().cuda()
-        features_rest = torch.from_numpy(features_rest).contiguous().cuda()
-        opacity = torch.from_numpy(opacity).cuda()
-        scaling = torch.from_numpy(scaling).cuda()
-        rotation = torch.from_numpy(rotation).cuda()
-        texel_size = torch.from_numpy(texel_size).cuda()
+        xyz = torch.from_numpy(xyz).to(self.device)
+        features_dc = torch.from_numpy(features_dc).contiguous().to(self.device)
+        features_rest = torch.from_numpy(features_rest).contiguous().to(self.device)
+        opacity = torch.from_numpy(opacity).to(self.device)
+        scaling = torch.from_numpy(scaling).to(self.device)
+        rotation = torch.from_numpy(rotation).to(self.device)
+        texel_size = torch.from_numpy(texel_size).to(self.device)
 
         return {'xyz': xyz,
                 'opacity': opacity,
@@ -371,7 +372,7 @@ class GaussianModel:
 
         # Unactivate texture map values
         texture_map = self.inverse_texture_map_activation(texture_map)
-        self._texture_map = JaggedTensor(self._calculate_active_texture_resolution(powers_of_two=False).int(), texture_map.cuda())
+        self._texture_map = JaggedTensor(self._calculate_active_texture_resolution(powers_of_two=False).int(), texture_map.to(self.device))
 
     def prune_points(self, mask, optimizer):
         valid_points_mask = ~mask
@@ -484,7 +485,7 @@ class GaussianModel:
         self.error_stats.contributions = torch.cat((self.error_stats.contributions, self.error_stats.contributions[densification_mask].repeat(repeats, 1)))
         self.error_stats.areas = torch.cat((self.error_stats.areas, self.error_stats.areas[densification_mask].repeat(repeats, 1)))
 
-        self.density_gradient_accum = torch.zeros((self.num_primitives, 1), device="cuda")
+        self.density_gradient_accum = torch.zeros((self.num_primitives, 1), device=self.device)
         torch.cuda.empty_cache()
 
     def prune(self,
@@ -546,7 +547,7 @@ class GaussianModel:
                 new_texture_map._sizes[curr_mask], 
                 self.inverse_texture_map_activation(torch.nn.functional.interpolate(curr_texture_map.permute(0, 3, 1, 2), mode="nearest", scale_factor=factor).permute(0, 2, 3, 1).reshape(-1, 3)))
 
-            source_mask = torch.arange(curr_mask.shape[0], device="cuda", dtype=torch.int32)
+            source_mask = torch.arange(curr_mask.shape[0], device=self.device, dtype=torch.int32)
             new_texture_map.central_crop(upsampled_tex_map, source_mask, curr_mask)
 
             added_memory += int(torch.prod(new_texture_map._sizes[curr_mask] - self._texture_map._sizes[curr_mask], dim=1).sum().item())
@@ -578,7 +579,7 @@ class GaussianModel:
         downsampled_texture_resolution = self._texture_map._sizes[activation_mask] // 2
         downsampled_texture_map = JaggedTensor(downsampled_texture_resolution)
 
-        loss = torch.zeros(int(activation_mask.sum()), device="cuda")
+        loss = torch.zeros(int(activation_mask.sum()), device=self.device)
 
         for curr_tex_res in texture_resolution.unique(dim=0):
             curr_original_mask_boolean = torch.logical_and(
@@ -611,8 +612,8 @@ class GaussianModel:
             loss[curr_downsampled_mask_boolean] = (difference * clamped_kernels).abs().sum(dim=[1, 2]) / weight_sum
 
 
-        original_indices_mask = torch.arange(self._texture_map.n_tensors, device="cuda")
-        original_mask_boolean = torch.zeros(self._texture_map.n_tensors, dtype=torch.bool, device="cuda")
+        original_indices_mask = torch.arange(self._texture_map.n_tensors, device=self.device)
+        original_mask_boolean = torch.zeros(self._texture_map.n_tensors, dtype=torch.bool, device=self.device)
 
         downsampled_mask_boolean = loss < downscale_threshold
 
@@ -660,7 +661,7 @@ class GaussianModel:
         # Shape N x 3 x 2 directions
         tangent_vectors = rotations[:, :, :2]
 
-        directions = torch.empty((0,2), device="cuda")
+        directions = torch.empty((0,2), device=self.device)
         
         # Find primitives that stretch beyond maximum texture resolution
         overflow_mask = active_texture_resolution[:, direction_idx] > splitting_threshold[direction_idx]
@@ -672,7 +673,7 @@ class GaussianModel:
         splitting_mask = torch.logical_and(overflow_mask, error_mask)
 
         if splitting_mask.sum() == 0 or (max_points != -1 and self.num_primitives >= max_points):
-            return torch.zeros(self.num_primitives, device="cuda", dtype=torch.bool)
+            return torch.zeros(self.num_primitives, device=self.device, dtype=torch.bool)
 
         # Make sure to not pass over the max_points threshold by limiting the 
         # primitives getting split
@@ -687,8 +688,8 @@ class GaussianModel:
         magnitude = 1
         gaussian_falloff_at_offset = float(np.exp(-1/2*offset**2))
         
-        directions = offset/6 * torch.tensor([[(1-direction_idx), direction_idx], [-(1-direction_idx), -direction_idx]], device="cuda")[:, None]
-        corrected_directions = torch.zeros(int(splitting_mask.sum()) * 2, 1, 2, device="cuda")
+        directions = offset/6 * torch.tensor([[(1-direction_idx), direction_idx], [-(1-direction_idx), -direction_idx]], device=self.device)[:, None]
+        corrected_directions = torch.zeros(int(splitting_mask.sum()) * 2, 1, 2, device=self.device)
         new_texture_resolution = texture_resolution[splitting_mask].repeat((2, 1))
         new_texture_map = JaggedTensor(new_texture_resolution)
 
@@ -699,14 +700,14 @@ class GaussianModel:
                 continue
 
             # Get the mask to filter the primitives of the new_textuer_map
-            new_res_mask = (new_texture_map._sizes == torch.tensor([curr_tex_res[0], curr_tex_res[1]], device="cuda", dtype=torch.int32)).all(dim=1)
+            new_res_mask = (new_texture_map._sizes == torch.tensor([curr_tex_res[0], curr_tex_res[1]], device=self.device, dtype=torch.int32)).all(dim=1)
             
             new_center_shift = (-directions * active_texture_resolution[curr_res_mask]).int()
             
             # Crop the original texture maps at the dispalced locations
             new_texture_map.central_crop(
                 self._texture_map,
-                torch.arange(self._texture_map.n_tensors, device="cuda", dtype=torch.int32)[curr_res_mask].repeat(2),
+                torch.arange(self._texture_map.n_tensors, device=self.device, dtype=torch.int32)[curr_res_mask].repeat(2),
                 new_res_mask,
                 new_center_shift.reshape(-1, 2).int())
 
@@ -720,7 +721,7 @@ class GaussianModel:
         new_features_dc = self._features_dc[splitting_mask].repeat((2, 1, 1))
         new_features_rest = self._features_rest[splitting_mask].repeat((2, 1, 1))
         
-        new_opacities = self.inverse_opacity_activation(self.get_opacity[splitting_mask].repeat((2, 1)) * magnitude * torch.tensor([[gaussian_falloff_at_offset, gaussian_falloff_at_offset]], device="cuda").repeat(int(splitting_mask.sum()), 1).T.reshape(-1 ,1))
+        new_opacities = self.inverse_opacity_activation(self.get_opacity[splitting_mask].repeat((2, 1)) * magnitude * torch.tensor([[gaussian_falloff_at_offset, gaussian_falloff_at_offset]], device=self.device).repeat(int(splitting_mask.sum()), 1).T.reshape(-1 ,1))
         scaling = self.get_scaling[splitting_mask].repeat((2, 1))
         scaling[:, direction_idx] = (scaling[:, direction_idx] / 2).clamp_max(splitting_threshold[direction_idx] * self.texel_size[splitting_mask].view(-1).repeat((2)) / 3)
         new_scaling = self.scaling_inverse_activation(scaling)
@@ -738,7 +739,7 @@ class GaussianModel:
                                    densification_mask = splitting_mask,
                                    repeats = 2)
         
-        return torch.cat((splitting_mask, torch.zeros(new_xyz.shape[0], device="cuda", dtype=torch.bool)))
+        return torch.cat((splitting_mask, torch.zeros(new_xyz.shape[0], device=self.device, dtype=torch.bool)))
 
     @torch.no_grad()
     def initialise_texel_pixel_ratio(self, initial_texture_resolution: torch.Tensor):

@@ -86,7 +86,7 @@ def test_gaussian_model_safe_pruning():
     from scene.gaussian_model import GaussianModel
     
     # 创建测试GaussianModel
-    gmodel = GaussianModel(sh_degree=3, max_texture_resolution=256)
+    gmodel = GaussianModel(sh_degree=3, max_texture_resolution=256, device="cpu")
     
     # 检查是否有新的方法
     assert hasattr(gmodel, 'prune_by_mask'), "GaussianModel should have prune_by_mask method"
