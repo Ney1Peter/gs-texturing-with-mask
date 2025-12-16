@@ -13,10 +13,11 @@ import torch
 from torch import nn
 import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
+from torchvision.transforms import functional as F
 
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
-                 image_name, uid,
+                 image_name, uid, mask=None,
                  trans=np.array([0.0, 0.0, 0.0]), scale=1.0, data_device = "cuda"):
         super(Camera, self).__init__()
 
@@ -43,6 +44,16 @@ class Camera(nn.Module):
             self.original_image *= gt_alpha_mask.to(self.data_device)
         else:
             self.original_image *= torch.ones((1, self.image_height, self.image_width), device=self.data_device)
+
+        # ==================== Mask处理逻辑 ====================
+        if mask is not None:
+            # 将mask调整到与图像匹配的分辨率
+            resized_mask_pil = mask.resize((self.image_width, self.image_height))
+            self.original_mask = F.to_tensor(resized_mask_pil).to(self.data_device)
+        else:
+            # 如果没有提供mask，默认创建一个全为1的mask（即不进行任何遮挡）
+            self.original_mask = torch.ones((1, self.image_height, self.image_width), device=self.data_device)
+        # =====================================================
 
         self.zfar = 100.0
         self.znear = 0.01

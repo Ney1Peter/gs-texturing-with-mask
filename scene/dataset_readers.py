@@ -36,6 +36,7 @@ class CameraInfo(NamedTuple):
     image_name: str
     width: int
     height: int
+    mask: Image.Image
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -96,6 +97,11 @@ def readImages(images_folder, name):
 
 def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
     cam_infos = []
+    
+    # 检查是否存在masks文件夹
+    mask_folder = os.path.join(os.path.dirname(images_folder), "masks")
+    use_masks = os.path.exists(mask_folder)
+    
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
         # the exact output you're looking for:
@@ -108,8 +114,18 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
 
         image_path, image_name, image = readImages(images_folder, extr.name)
 
+        # 加载mask
+        mask = None
+        if use_masks:
+            mask_path = os.path.join(mask_folder, extr.name)
+            if os.path.exists(mask_path):
+                mask = Image.open(mask_path)
+            else:
+                # 如果masks文件夹存在但特定mask文件不存在，创建默认的全白mask
+                mask = Image.new('L', (width, height), 255)
+
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                              image_path=image_path, image_name=image_name, width=width, height=height)
+                              image_path=image_path, image_name=image_name, width=width, height=height, mask=mask)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
@@ -167,6 +183,66 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, init_type="sfm", num_pts
         cam_intrinsics=cam_intrinsics,
         images_folder=os.path.join(path, reading_dir))
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
+
+    # >>> START OF NEW FILTERING LOGIC <<<
+    # 检查是否有任何相机有mask数据
+    has_masks = any(c.mask is not None for c in cam_infos)
+    
+    if has_masks and init_type == "sfm":
+        print("Filtering initial point cloud based on masks...")
+        # 1. 创建一个快速查找映射从图像名称到其mask
+        mask_map = {ci.image_name: ci.mask for ci in cam_infos if ci.mask is not None}
+        
+        # 2. 识别所有在任何图像中落入mask区域的3D点ID
+        invalid_point3D_ids = set()
+        
+        # 统计信息
+        total_points_checked = 0
+        total_points_invalid = 0
+        
+        for extr in cam_extrinsics.values():
+            if extr.name not in mask_map:
+                continue
+            
+            mask = mask_map[extr.name]
+            mask_pixels = mask.load()
+            mask_width, mask_height = mask.size
+            
+            # 创建更严格的mask检查
+            # 不仅检查点本身，还检查其邻近区域
+            for xy, point3D_id in zip(extr.xys, extr.point3D_ids):
+                if point3D_id == -1:
+                    continue
+                
+                total_points_checked += 1
+                x, y = int(xy[0]), int(xy[1])
+                
+                # 检查坐标是否在mask的有效范围内
+                if 0 <= x < mask_width and 0 <= y < mask_height:
+                    # 检查点本身及其邻近区域
+                    is_invalid = False
+                    # 检查3x3邻域
+                    for dx in [-1, 0, 1]:
+                        for dy in [-1, 0, 1]:
+                            nx, ny = x + dx, y + dy
+                            if 0 <= nx < mask_width and 0 <= ny < mask_height:
+                                if mask_pixels[nx, ny] == 0:  # 黑色区域（人物区域）
+                                    is_invalid = True
+                                    break
+                        if is_invalid:
+                            break
+                    
+                    if is_invalid:
+                        invalid_point3D_ids.add(point3D_id)
+                        total_points_invalid += 1
+                else:
+                    # 超出边界的点也标记为无效
+                    invalid_point3D_ids.add(point3D_id)
+                    total_points_invalid += 1
+        
+        print(f"Found {len(invalid_point3D_ids)} 3D points to remove from initial cloud.")
+        print(f"Total points checked: {total_points_checked}, Invalid points: {total_points_invalid}")
+    # >>> END OF NEW FILTERING LOGIC <<<
 
     if eval:
         train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]

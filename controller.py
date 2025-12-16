@@ -273,9 +273,13 @@ class Trainer:
         self.image: torch.Tensor = render_pkg["render"]
         self.visibility_filter: torch.Tensor = render_pkg["visibility_filter"]
         self.out_weight: torch.Tensor = render_pkg["out_weight"]
+        self.current_viewpoint: Camera = viewpoint  # 存储当前视角以便在损失计算中使用
 
     def compute_losses(self, gt_image: torch.Tensor):
         """Compute the different loss functions and the total loss."""
+
+        # 获取mask信息
+        mask = self.current_viewpoint.original_mask.cuda()
 
         # Per gaussian losses
         if self._opt_args.lambda_alpha_regul == 0:
@@ -286,8 +290,9 @@ class Trainer:
         Ltexture_regul = (self.gmodel.texture_offsets.abs() * self.gmodel._texture_map.create_jagged_mask(self.visibility_filter).view(-1, 1)).sum()
         # Ltexture_regul = (self.gmodel.texture_offsets.abs() * (1-self.out_weight.detach()).repeat_interleave(repeats=torch.prod(self.gmodel._texture_map._sizes, dim=1).int()).view(-1, 1) * self.gmodel._texture_map.create_jagged_mask(self.visibility_filter).view(-1, 1)).sum()
 
-        Ll1 = l1_loss(self.image, gt_image)
-        ssim_loss = 1.0 - ssim(self.image, gt_image)
+        # 应用mask到损失计算
+        Ll1 = l1_loss(self.image * mask, gt_image * mask)
+        ssim_loss = 1.0 - ssim(self.image * mask, gt_image * mask)
 
         self.loss = Ll1 * (1.0 - self._opt_args.lambda_dssim) \
                + ssim_loss * self._opt_args.lambda_dssim \
@@ -381,6 +386,10 @@ class Trainer:
         if iteration < self._opt_args.iterations and iteration % self._opt_args.batch_size == 0:
             self.optimizer_step(iteration)
 
+            # Early pruning of foreground points based on projection mask at iteration 100
+            if iteration == 100:
+                self.early_mask_pruning()
+
             # At the first iteration, calculate the sizes
             # (some issue with the optimizer prevents us to do it before)
             if iteration == 1 or iteration % 100 == 0:
@@ -389,6 +398,33 @@ class Trainer:
             # Update the splitting threshold
             self.curr_splitting_threshold = max(self.curr_splitting_threshold-(self.max_splitting_threshold-self.min_splitting_threshold) / 7000, self.min_splitting_threshold)
 
+
+    def early_mask_pruning(self):
+        """在第100步执行基于mask的早期裁剪"""
+        if hasattr(self, 'current_viewpoint') and hasattr(self.current_viewpoint, 'original_mask'):
+            mask_2d = self.current_viewpoint.original_mask[0]
+            
+            # 获取当前渲染的viewspace points
+            render_pkg = Controller.render_gmodel(self.gmodel, self._pipe_args, self.bg_color, self.current_viewpoint)
+            viewspace_points = render_pkg.get("viewspace_points")
+            
+            if viewspace_points is not None:
+                H, W = mask_2d.shape[-2:]
+                
+                # 将viewspace坐标转换为图像坐标
+                proj_x = (viewspace_points[:, 0] * W).long().clamp(0, W-1)
+                proj_y = (viewspace_points[:, 1] * H).long().clamp(0, H-1)
+                
+                # 检查哪些点投影到mask的白色区域（保留区域）
+                keep = (mask_2d[proj_y, proj_x] > 0.5)
+                
+                print(f"[DEBUG] mask_2d.sum(): {mask_2d.sum().item()} / {H*W}")
+                print(f"[DEBUG] viewspace_points.shape: {viewspace_points.shape}")
+                print(f"[DEBUG] Sampled mask values: {mask_2d[proj_y, proj_x][:10]}")
+                print(f"[Prune] Keeping {keep.sum()} / {keep.shape[0]} Gaussians (background only)")
+                
+                # 执行裁剪
+                self.gmodel.prune_by_mask(keep, self.optimizer)
 
     def optimizer_step(self, iteration: int):
         """Calls optimizer and schedulers step"""

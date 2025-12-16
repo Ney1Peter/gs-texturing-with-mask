@@ -373,26 +373,76 @@ class GaussianModel:
         texture_map = self.inverse_texture_map_activation(texture_map)
         self._texture_map = JaggedTensor(self._calculate_active_texture_resolution(powers_of_two=False).int(), texture_map.cuda())
 
-    # TODO Have a optimizer-less version (GaussianModel self contained)
     def prune_points(self, mask, optimizer):
         valid_points_mask = ~mask
-        optimizable_tensors = optimizer._prune_optimizer(valid_points_mask, self._texture_map._sizes)
+        
+        # 安全检查：如果optimizer存在，使用optimizer处理
+        if optimizer is not None:
+            optimizable_tensors = optimizer._prune_optimizer(valid_points_mask, self._texture_map._sizes)
+            self._xyz = optimizable_tensors["xyz"]
+            self._features_dc = optimizable_tensors["f_dc"]
+            self._features_rest = optimizable_tensors["f_rest"]
+            self._texture_map._values = optimizable_tensors["texture_map"]
+            self._opacity = optimizable_tensors["opacity"]
+            self._scaling = optimizable_tensors["scaling"]
+            self._rotation = optimizable_tensors["rotation"]
+        else:
+            # 如果optimizer不存在，直接处理模型参数
+            self._xyz = self._xyz[valid_points_mask]
+            self._features_dc = self._features_dc[valid_points_mask]
+            self._features_rest = self._features_rest[valid_points_mask]
+            self._texture_map._values = self._texture_map._values[self._texture_map.create_jagged_mask(valid_points_mask)]
+            self._opacity = self._opacity[valid_points_mask]
+            self._scaling = self._scaling[valid_points_mask]
+            self._rotation = self._rotation[valid_points_mask]
 
-        self._xyz = optimizable_tensors["xyz"]
-        self._features_dc = optimizable_tensors["f_dc"]
-        self._features_rest = optimizable_tensors["f_rest"]
-        self._texture_map._values = optimizable_tensors["texture_map"]
-        self._opacity = optimizable_tensors["opacity"]
-        self._scaling = optimizable_tensors["scaling"]
-        self._rotation = optimizable_tensors["rotation"]
+        # 安全处理训练相关张量
+        if hasattr(self, 'error_stats') and self.error_stats is not None:
+            if hasattr(self.error_stats, 'errors') and self.error_stats.errors.shape[0] > 0:
+                self.error_stats.errors = self.error_stats.errors[valid_points_mask]
+                self.error_stats.areas = self.error_stats.areas[valid_points_mask]
+                self.error_stats.contributions = self.error_stats.contributions[valid_points_mask]
 
-        # Prune the error stats tensors
-        self.error_stats.errors = self.error_stats.errors[valid_points_mask]
-        self.error_stats.areas = self.error_stats.areas[valid_points_mask]
-        self.error_stats.contributions = self.error_stats.contributions[valid_points_mask]
+        if hasattr(self, '_texel_pixel_ratio') and self._texel_pixel_ratio.shape[0] > 0:
+            self._texel_pixel_ratio = self._texel_pixel_ratio[valid_points_mask]
+        
+        if hasattr(self, '_texture_map') and hasattr(self._texture_map, '_sizes'):
+            self._texture_map._sizes = self._texture_map._sizes[valid_points_mask]
 
-        self._texel_pixel_ratio = self._texel_pixel_ratio[valid_points_mask]
-        self._texture_map._sizes = self._texture_map._sizes[valid_points_mask]
+    def prune_by_mask(self, valid_mask: torch.Tensor, optimizer=None):
+        """保留 valid_mask 为 True 的 Gaussians，其余剔除"""
+        # 处理优化器状态（如果存在）
+        if optimizer is not None:
+            optimizable_tensors = optimizer._prune_optimizer(valid_mask, self._texture_map._sizes)
+            self._xyz = optimizable_tensors["xyz"]
+            self._features_dc = optimizable_tensors["f_dc"]
+            self._features_rest = optimizable_tensors["f_rest"]
+            self._texture_map._values = optimizable_tensors["texture_map"]
+            self._opacity = optimizable_tensors["opacity"]
+            self._scaling = optimizable_tensors["scaling"]
+            self._rotation = optimizable_tensors["rotation"]
+        else:
+            # 直接处理模型参数
+            self._xyz = self._xyz[valid_mask]
+            self._features_dc = self._features_dc[valid_mask]
+            self._features_rest = self._features_rest[valid_mask]
+            self._texture_map._values = self._texture_map._values[self._texture_map.create_jagged_mask(valid_mask)]
+            self._opacity = self._opacity[valid_mask]
+            self._scaling = self._scaling[valid_mask]
+            self._rotation = self._rotation[valid_mask]
+
+        # 处理训练相关张量
+        if hasattr(self, 'error_stats') and self.error_stats is not None:
+            if hasattr(self.error_stats, 'errors') and self.error_stats.errors.shape[0] > 0:
+                self.error_stats.errors = self.error_stats.errors[valid_mask]
+                self.error_stats.areas = self.error_stats.areas[valid_mask]
+                self.error_stats.contributions = self.error_stats.contributions[valid_mask]
+
+        if hasattr(self, '_texel_pixel_ratio') and self._texel_pixel_ratio.shape[0] > 0:
+            self._texel_pixel_ratio = self._texel_pixel_ratio[valid_mask]
+        
+        if hasattr(self, '_texture_map') and hasattr(self._texture_map, '_sizes'):
+            self._texture_map._sizes = self._texture_map._sizes[valid_mask]
 
     # TODO Have a optimizer-less version (GaussianModel self contained)
     def densification_postfix(self,

@@ -65,7 +65,9 @@ class CameraInformation(Widget):
         match self.display_mode:
             case "rgb":
                 if size_h != self.camera.original_image.shape[0] or size_w != self.camera.original_image.shape[1]:
-                    img = Resize([size_h, size_w])(self.camera.original_image)
+                    # img = Resize([size_h, size_w])(self.camera.original_image)
+                    # 修改 viewer.py 第 253 行附近
+                    img = Resize([size_h, size_w], antialias=False)(self.camera.original_image)
                 else:
                     img = self.camera.original_image
                 self.image_display.step(img.permute(1,2,0))
